@@ -24,7 +24,7 @@ import {
   parseCommit,
   parseTag,
   readPack,
-  writePack,
+  writePackForShas,
 } from './gitobj.ts';
 import type { GitObject } from './store.ts';
 import { PKT_FLUSH, pktLine, readPkts, sideband } from './pktline.ts';
@@ -140,6 +140,7 @@ function lsRefs(store: Store, repo: Repo, args: readonly string[], res: ServerRe
 
 interface FetchPlan {
   objects: GitObject[];
+  shas: string[];
   shallow: string[];
   unshallow: string[];
 }
@@ -262,11 +263,54 @@ function planFetch(
     else if (shallowSet.has(sha)) unshallow.push(sha);
   }
 
-  const objects = [...send]
-    .sort()
+  const shas = [...send].sort();
+  const objects = shas
     .map((sha) => store.objects.get(sha))
     .filter((obj): obj is GitObject => obj !== undefined);
-  return { objects, shallow, unshallow };
+  return { objects, shas, shallow, unshallow };
+}
+
+// ------------------------------------------------------------ fetch cache
+
+/**
+ * Whole-response memoisation for fetch. A fetch response is a pure
+ * function of the repository's ref tips and the request's wants, haves,
+ * shallow list and depth: the object graph is append-only and
+ * content-addressed, so identical tips plus identical arguments always
+ * produce identical bytes. Concurrent identical clones (the common case)
+ * therefore share one planned, packed response. The cache is a pure
+ * optimisation with a small FIFO cap; correctness never depends on it.
+ */
+const fetchResponseCache = new Map<string, Buffer>();
+const FETCH_CACHE_MAX_ENTRIES = 24;
+const FETCH_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+
+function fetchCacheKey(
+  repo: Repo,
+  variant: string,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallowClient: readonly string[],
+  depth: number | null,
+): string {
+  const tips = [...repo.refs.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([name, sha]) => `${name}=${sha}`)
+    .join(',');
+  return [repo.name, variant, tips, wants.join(','), haves.join(','), shallowClient.join(','), depth ?? ''].join('|');
+}
+
+function fetchCacheGet(key: string): Buffer | undefined {
+  return fetchResponseCache.get(key);
+}
+
+function fetchCachePut(key: string, body: Buffer): void {
+  if (body.length > FETCH_CACHE_MAX_BYTES) return;
+  if (fetchResponseCache.size >= FETCH_CACHE_MAX_ENTRIES) {
+    const oldest = fetchResponseCache.keys().next().value;
+    if (oldest !== undefined) fetchResponseCache.delete(oldest);
+  }
+  fetchResponseCache.set(key, body);
 }
 
 function fetchV2(store: Store, repo: Repo, args: readonly string[], res: ServerResponse): void {
@@ -279,6 +323,12 @@ function fetchV2(store: Store, repo: Repo, args: readonly string[], res: ServerR
     else if (arg.startsWith('have ')) haves.push(arg.slice(5).trim());
     else if (arg.startsWith('shallow ')) shallowClient.push(arg.slice(8).trim());
     else if (arg.startsWith('deepen ')) depth = Number.parseInt(arg.slice(7).trim(), 10);
+  }
+  const cacheKey = fetchCacheKey(repo, 'v2', wants, haves, shallowClient, depth);
+  const cached = fetchCacheGet(cacheKey);
+  if (cached !== undefined) {
+    sendBody(res, 200, cached, 'application/x-git-upload-pack-result');
+    return;
   }
   const plan = planFetch(store, wants, haves, shallowClient, depth);
   const parts: Buffer[] = [];
@@ -295,14 +345,16 @@ function fetchV2(store: Store, repo: Repo, args: readonly string[], res: ServerR
     for (const sha of plan.unshallow) parts.push(pktLine(`unshallow ${sha}\n`));
     parts.push(PKT_FLUSH);
   }
-  const pack = writePack(plan.objects);
+  const pack = writePackForShas(store, plan.shas);
   parts.push(pktLine('packfile\n'));
   const CHUNK = 32768;
   for (let at = 0; at < pack.length; at += CHUNK) {
     parts.push(sideband(1, pack.subarray(at, at + CHUNK)));
   }
   parts.push(PKT_FLUSH);
-  sendBody(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(parts);
+  fetchCachePut(cacheKey, body);
+  sendBody(res, 200, body, 'application/x-git-upload-pack-result');
 }
 
 function fetchV0(store: Store, repo: Repo, lines: readonly string[], res: ServerResponse): void {
@@ -317,18 +369,26 @@ function fetchV0(store: Store, repo: Repo, lines: readonly string[], res: Server
     else if (line.startsWith('shallow ')) shallowClient.push(line.slice(8, 48));
     else if (line.startsWith('deepen ')) depth = Number.parseInt(line.slice(7), 10);
   }
+  const cacheKey = fetchCacheKey(repo, 'v0', wants, haves, shallowClient, depth);
+  const cached = fetchCacheGet(cacheKey);
+  if (cached !== undefined) {
+    sendBody(res, 200, cached, 'application/x-git-upload-pack-result');
+    return;
+  }
   const plan = planFetch(store, wants, haves, shallowClient, depth);
   const parts: Buffer[] = [];
   for (const sha of plan.shallow) parts.push(pktLine(`shallow ${sha}\n`));
   for (const sha of plan.unshallow) parts.push(pktLine(`unshallow ${sha}\n`));
   parts.push(pktLine('NAK\n'));
-  const pack = writePack(plan.objects);
+  const pack = writePackForShas(store, plan.shas);
   const CHUNK = 32768;
   for (let at = 0; at < pack.length; at += CHUNK) {
     parts.push(sideband(1, pack.subarray(at, at + CHUNK)));
   }
   parts.push(PKT_FLUSH);
-  sendBody(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(parts);
+  fetchCachePut(cacheKey, body);
+  sendBody(res, 200, body, 'application/x-git-upload-pack-result');
 }
 
 function uploadPack(ctx: Ctx, repo: Repo, req: IncomingMessage, body: Buffer, res: ServerResponse): void {

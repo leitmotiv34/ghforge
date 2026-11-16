@@ -341,6 +341,55 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   return Buffer.concat([body, trailer]);
 }
 
+// ------------------------------------------------------- pack entry cache
+
+/**
+ * A pack entry (the size/type varint plus the deflated bytes) for one
+ * object, memoised by sha. Objects are immutable and content-addressed, so
+ * an entry never changes once built; repeated fetches of the same history
+ * reuse the deflated bytes instead of compressing every object again.
+ * The cache is a pure optimisation: on the (practically unreachable) size
+ * cap it simply clears and rebuilds.
+ */
+const packEntryCache = new Map<string, Buffer>();
+
+function packEntry(sha: string, obj: GitObject): Buffer {
+  const hit = packEntryCache.get(sha);
+  if (hit !== undefined) return hit;
+  const size = obj.data.length;
+  const bytes: number[] = [];
+  let first = (TYPE_IDS[obj.type] << 4) | (size & 0x0f);
+  let rest = size >> 4;
+  if (rest > 0) first |= 0x80;
+  bytes.push(first);
+  while (rest > 0) {
+    let byte = rest & 0x7f;
+    rest >>= 7;
+    if (rest > 0) byte |= 0x80;
+    bytes.push(byte);
+  }
+  const entry = Buffer.concat([Buffer.from(bytes), deflateSync(obj.data)]);
+  if (packEntryCache.size > 262144) packEntryCache.clear();
+  packEntryCache.set(sha, entry);
+  return entry;
+}
+
+/** Serialize the given objects (by sha) into a packfile, reusing entries. */
+export function writePackForShas(store: Store, shas: readonly string[]): Buffer {
+  const entries: Buffer[] = [];
+  for (const sha of shas) {
+    const obj = store.objects.get(sha);
+    if (obj !== undefined) entries.push(packEntry(sha, obj));
+  }
+  const header = Buffer.alloc(12);
+  header.write('PACK', 0, 'utf8');
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(entries.length, 8);
+  const body = Buffer.concat([header, ...entries]);
+  const trailer = createHash('sha1').update(body).digest();
+  return Buffer.concat([body, trailer]);
+}
+
 // ------------------------------------------------------------------ closure
 
 /**
