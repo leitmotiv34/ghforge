@@ -88,6 +88,27 @@ export function issueJson(ctx: Ctx, repo: Repo, issue: Issue): Record<string, un
   };
 }
 
+/**
+ * Serialised GET-issue responses, memoised by everything the body depends
+ * on: the issue's update tick (every mutation bumps it), its comment count
+ * and the adopted login. Repeated reads of an unchanged issue — the common
+ * case — skip rebuilding and re-stringifying the same object. Pure
+ * optimisation; the wire bytes are exactly what sendJson would produce.
+ */
+const issueTextCache = new Map<string, string>();
+
+function sendIssueJson(ctx: Ctx, res: ServerResponse, repo: Repo, issue: Issue): void {
+  const key = `${repo.name}#${issue.number}@${issue.updatedAt}:${issue.comments.length}:${ctx.store.loginOr('')}`;
+  let text = issueTextCache.get(key);
+  if (text === undefined) {
+    text = `${JSON.stringify(issueJson(ctx, repo, issue))}\n`;
+    if (issueTextCache.size > 4096) issueTextCache.clear();
+    issueTextCache.set(key, text);
+  }
+  res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) });
+  res.end(text);
+}
+
 export function pullJson(ctx: Ctx, repo: Repo, pull: Pull): Record<string, unknown> {
   const login = ctx.store.loginOr('');
   const headSha = repo.refs.get(`refs/heads/${pull.headRef}`) ?? '';
@@ -498,7 +519,7 @@ export async function handleRest(
     const issue = repo.issues.get(Number(issueMatch[1]));
     if (issue === undefined) return notFound();
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(ctx, repo, issue));
+      sendIssueJson(ctx, res, repo, issue);
       return;
     }
     if (method === 'PATCH') {

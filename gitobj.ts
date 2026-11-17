@@ -421,16 +421,35 @@ export function closureOf(store: Store, tips: readonly string[], stopAt?: Readon
 }
 
 /** Ancestor closure of commit shas only (commits, via parents). */
+/**
+ * Parsed-commit memoisation, by sha. Commits are immutable, so a parse
+ * never goes stale; history walks (fast-forward checks, fetch planning)
+ * reuse parses instead of decoding the same commit bytes on every visit.
+ * Pure optimisation with a size cap that simply clears and rebuilds.
+ */
+const commitParseCache = new Map<string, CommitParts>();
+
+export function parseCommitCached(store: Store, sha: string): CommitParts | null {
+  const hit = commitParseCache.get(sha);
+  if (hit !== undefined) return hit;
+  const obj = store.objects.get(sha);
+  if (obj === undefined || obj.type !== 'commit') return null;
+  const parsed = parseCommit(obj.data);
+  if (commitParseCache.size > 262144) commitParseCache.clear();
+  commitParseCache.set(sha, parsed);
+  return parsed;
+}
+
 export function commitClosure(store: Store, tips: readonly string[]): Set<string> {
   const seen = new Set<string>();
   const stack = [...tips];
   while (stack.length > 0) {
     const sha = stack.pop() as string;
     if (seen.has(sha)) continue;
-    const obj = store.objects.get(sha);
-    if (obj === undefined || obj.type !== 'commit') continue;
+    const parsed = parseCommitCached(store, sha);
+    if (parsed === null) continue;
     seen.add(sha);
-    for (const parent of parseCommit(obj.data).parents) stack.push(parent);
+    for (const parent of parsed.parents) stack.push(parent);
   }
   return seen;
 }
@@ -438,5 +457,9 @@ export function commitClosure(store: Store, tips: readonly string[]): Set<string
 /** Is `ancestor` reachable from `descendant` through commit parents? */
 export function isAncestor(store: Store, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
+  // The common case (a ref extended by one commit) is decided by looking
+  // at the descendant's parent list alone, without walking the history.
+  const tip = parseCommitCached(store, descendant);
+  if (tip !== null && tip.parents.includes(ancestor)) return true;
   return commitClosure(store, [descendant]).has(ancestor);
 }
